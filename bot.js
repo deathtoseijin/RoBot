@@ -10,10 +10,6 @@ const client = new Client({
 
 const PREFIX = "!roblox";
 
-// Asset types that are visual (can show an image)
-const VISUAL_ASSET_TYPES = new Set([1, 2, 8, 11, 12, 13, 17, 18, 19, 21, 32, 38,
-  40, 41, 42, 43, 44, 45, 46, 61, 62, 64, 65, 66, 67, 68, 69, 70, 71, 72, 76, 77, 80]);
-
 const ASSET_TYPE_NAMES = {
   1: "Image", 2: "T-Shirt", 3: "Audio", 4: "Mesh", 5: "Lua",
   6: "HTML", 7: "Text", 8: "Hat", 9: "Place", 10: "Model",
@@ -35,16 +31,23 @@ const ASSET_TYPE_NAMES = {
   79: "MoodAnimation", 80: "DynamicHead",
 };
 
+// Clothing types that wrap a texture image inside XML
+const CLOTHING_TYPES = new Set([2, 11, 12]); // T-Shirt, Shirt, Pants
+// Decal type also wraps an image
+const DECAL_TYPE = 13;
+// Raw image type
+const IMAGE_TYPE = 1;
+
 async function fetchAssetDetails(assetId) {
   const res = await fetch(`https://economy.roblox.com/v2/assets/${assetId}/details`);
   if (!res.ok) throw new Error(`Asset not found (HTTP ${res.status})`);
   return res.json();
 }
 
-// Strategy 1: thumbnails API (works for catalog items, accessories, etc.)
-async function fetchThumbnailAPI(assetId) {
+// Fetch the mannequin/preview thumbnail (for accessories, hats, gear etc.)
+async function fetchThumbnailAPI(assetId, size = "420x420") {
   const res = await fetch(
-    `https://thumbnails.roblox.com/v1/assets?assetIds=${assetId}&size=420x420&format=Png&isCircular=false`
+    `https://thumbnails.roblox.com/v1/assets?assetIds=${assetId}&size=${size}&format=Png&isCircular=false`
   );
   if (!res.ok) return null;
   const data = await res.json();
@@ -53,51 +56,64 @@ async function fetchThumbnailAPI(assetId) {
   return item.imageUrl;
 }
 
-// Strategy 2: asset delivery API — works for raw images/decals uploaded to Roblox
-async function fetchAssetDeliveryURL(assetId) {
-  // This redirects to the actual CDN file URL
-  const res = await fetch(`https://assetdelivery.roblox.com/v1/asset/?id=${assetId}`, {
-    redirect: "follow",
-    headers: { "User-Agent": "Roblox/WinInet" }
-  });
-  if (!res.ok) return null;
-
-  // The final URL after redirect is the CDN image URL
-  const finalUrl = res.url;
-  const contentType = res.headers.get("content-type") || "";
-
-  // Only return if it's actually an image
-  if (contentType.startsWith("image/")) {
-    return { url: finalUrl, buffer: Buffer.from(await res.arrayBuffer()), contentType };
-  }
-
-  // For XML/RBXM assets (models, decals wrapping an image), try to extract image ID
-  if (contentType.includes("xml") || contentType.includes("text")) {
-    const text = await res.text().catch(() => null);
-    if (text) {
-      // Decals contain a reference to an image asset ID inside XML
-      const match = text.match(/http[s]?:\/\/www\.roblox\.com\/asset\/\?id=(\d+)/i)
-                 || text.match(/<url>.*?\/asset\/\?id=(\d+)<\/url>/i)
-                 || text.match(/rbxassetid:\/\/(\d+)/i);
-      if (match) {
-        return { redirectId: match[1] };
+// Fetch the raw asset file and parse the inner image ID from XML (for shirts, pants, decals)
+async function fetchInnerImageIdFromAsset(assetId) {
+  try {
+    const res = await fetch(`https://assetdelivery.roblox.com/v1/asset/?id=${assetId}`, {
+      headers: {
+        "User-Agent": "RobloxStudio/WinInet",
+        "Accept": "*/*",
       }
-    }
-  }
+    });
+    if (!res.ok) return null;
 
-  return null;
+    const contentType = res.headers.get("content-type") || "";
+
+    // If it's a direct image, return the URL
+    if (contentType.startsWith("image/")) {
+      const buffer = Buffer.from(await res.arrayBuffer());
+      return { type: "buffer", buffer, contentType };
+    }
+
+    // If it's XML (clothing/decal asset file), parse the inner image ID
+    const text = await res.text();
+
+    // Patterns found in Roblox XML asset files
+    const patterns = [
+      /https?:\/\/(?:www\.)?roblox\.com\/asset\/\?id=(\d+)/i,
+      /<url>.*?\/asset\/\?id=(\d+).*?<\/url>/i,
+      /rbxassetid:\/\/(\d+)/i,
+      /ShirtTemplate.*?\/asset\/\?id=(\d+)/i,
+      /PantsTemplate.*?\/asset\/\?id=(\d+)/i,
+      /Texture.*?\/asset\/\?id=(\d+)/i,
+    ];
+
+    for (const pattern of patterns) {
+      const match = text.match(pattern);
+      if (match) return { type: "id", id: match[1] };
+    }
+
+    return null;
+  } catch (e) {
+    console.error("fetchInnerImageIdFromAsset error:", e.message);
+    return null;
+  }
 }
 
-// Strategy 3: game thumbnails endpoint (works for some assets)
-async function fetchGameThumbnail(assetId) {
-  const res = await fetch(
-    `https://thumbnails.roblox.com/v1/assets?assetIds=${assetId}&size=768x432&format=Png`
-  );
-  if (!res.ok) return null;
-  const data = await res.json();
-  const item = data?.data?.[0];
-  if (!item || item.state !== "Completed" || !item.imageUrl) return null;
-  return item.imageUrl;
+// Fetch an image buffer from a Roblox asset ID (must be a raw image type)
+async function fetchImageBuffer(assetId) {
+  try {
+    const res = await fetch(`https://assetdelivery.roblox.com/v1/asset/?id=${assetId}`, {
+      headers: { "User-Agent": "RobloxStudio/WinInet" }
+    });
+    if (!res.ok) return null;
+    const contentType = res.headers.get("content-type") || "";
+    if (!contentType.startsWith("image/")) return null;
+    const buffer = Buffer.from(await res.arrayBuffer());
+    return { buffer, contentType };
+  } catch {
+    return null;
+  }
 }
 
 async function fetchCreatorInfo(creatorType, creatorId) {
@@ -124,34 +140,63 @@ function formatDate(dateStr) {
   });
 }
 
+function getExtension(contentType) {
+  if (contentType?.includes("png")) return "png";
+  if (contentType?.includes("jpeg") || contentType?.includes("jpg")) return "jpg";
+  if (contentType?.includes("webp")) return "webp";
+  return "png";
+}
+
+// Main image resolution — tries different strategies based on asset type
 async function resolveImage(assetId, assetTypeId) {
-  // Try thumbnail API first (fastest)
-  const thumb = await fetchThumbnailAPI(assetId);
-  if (thumb) return { type: "url", value: thumb };
 
-  // Try asset delivery (for raw images, decals)
-  try {
-    const delivery = await fetchAssetDeliveryURL(assetId);
-    if (delivery) {
-      // If it redirected to another asset ID (e.g. decal → image)
-      if (delivery.redirectId) {
-        const innerThumb = await fetchThumbnailAPI(delivery.redirectId);
-        if (innerThumb) return { type: "url", value: innerThumb };
-
-        // Try delivery on the inner ID too
-        const innerDelivery = await fetchAssetDeliveryURL(delivery.redirectId);
-        if (innerDelivery?.buffer) {
-          return { type: "buffer", value: innerDelivery.buffer, contentType: innerDelivery.contentType };
-        }
+  // CLOTHING (Shirt, Pants, T-Shirt) — fetch the XML file and get the inner texture image
+  if (CLOTHING_TYPES.has(assetTypeId)) {
+    const inner = await fetchInnerImageIdFromAsset(assetId);
+    if (inner) {
+      if (inner.type === "id") {
+        // Try to get the actual texture image
+        const imgBuffer = await fetchImageBuffer(inner.id);
+        if (imgBuffer) return { type: "buffer", ...imgBuffer, label: "texture" };
+        // Fallback: thumbnail of inner image
+        const thumb = await fetchThumbnailAPI(inner.id);
+        if (thumb) return { type: "url", value: thumb, label: "texture" };
       }
-      // Direct image buffer
-      if (delivery.buffer) {
-        return { type: "buffer", value: delivery.buffer, contentType: delivery.contentType };
-      }
+      if (inner.type === "buffer") return { type: "buffer", ...inner, label: "texture" };
     }
-  } catch (e) {
-    console.error("Asset delivery error:", e.message);
+    // Last resort: mannequin thumbnail
+    const thumb = await fetchThumbnailAPI(assetId);
+    if (thumb) return { type: "url", value: thumb, label: "preview" };
+    return null;
   }
+
+  // DECAL — wraps an image in XML, extract inner image
+  if (assetTypeId === DECAL_TYPE) {
+    const inner = await fetchInnerImageIdFromAsset(assetId);
+    if (inner?.type === "id") {
+      const imgBuffer = await fetchImageBuffer(inner.id);
+      if (imgBuffer) return { type: "buffer", ...imgBuffer, label: "decal" };
+      const thumb = await fetchThumbnailAPI(inner.id);
+      if (thumb) return { type: "url", value: thumb, label: "decal" };
+    }
+    const thumb = await fetchThumbnailAPI(assetId);
+    if (thumb) return { type: "url", value: thumb, label: "preview" };
+    return null;
+  }
+
+  // RAW IMAGE — try direct delivery first
+  if (assetTypeId === IMAGE_TYPE) {
+    const imgBuffer = await fetchImageBuffer(assetId);
+    if (imgBuffer) return { type: "buffer", ...imgBuffer, label: "image" };
+    // Some images are accessible via thumbnail API
+    const thumb = await fetchThumbnailAPI(assetId);
+    if (thumb) return { type: "url", value: thumb, label: "image" };
+    return null;
+  }
+
+  // EVERYTHING ELSE (accessories, badges, gamepasses, hats, etc.) — use thumbnail API
+  const thumb = await fetchThumbnailAPI(assetId);
+  if (thumb) return { type: "url", value: thumb, label: "preview" };
 
   return null;
 }
@@ -197,7 +242,6 @@ client.on("messageCreate", async (message) => {
       ? await fetchCreatorInfo(details.Creator.CreatorType, details.Creator.CreatorTargetId)
       : null;
 
-    // Try to resolve an image through all strategies
     const imageResult = await resolveImage(assetId, details.AssetTypeId);
 
     const embed = new EmbedBuilder()
@@ -224,17 +268,18 @@ client.on("messageCreate", async (message) => {
       if (imageResult.type === "url") {
         embed.setImage(imageResult.value);
       } else if (imageResult.type === "buffer") {
-        // Determine extension from content type
-        const ext = imageResult.contentType?.includes("png") ? "png"
-                  : imageResult.contentType?.includes("jpeg") ? "jpg"
-                  : imageResult.contentType?.includes("webp") ? "webp"
-                  : "png";
-        const attachment = new AttachmentBuilder(imageResult.value, { name: `asset_${assetId}.${ext}` });
-        embed.setImage(`attachment://asset_${assetId}.${ext}`);
+        const ext = getExtension(imageResult.contentType);
+        const filename = `asset_${assetId}.${ext}`;
+        const attachment = new AttachmentBuilder(imageResult.buffer, { name: filename });
+        embed.setImage(`attachment://${filename}`);
         files.push(attachment);
       }
     } else {
-      embed.addFields({ name: "🖼️ Preview", value: "No preview available for this asset.", inline: false });
+      embed.addFields({
+        name: "🖼️ Preview",
+        value: "No preview available. This asset may be private or not publicly accessible.",
+        inline: false
+      });
     }
 
     await message.reply({ embeds: [embed], files });
