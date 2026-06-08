@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, EmbedBuilder, ActivityType } = require("discord.js");
+const { Client, GatewayIntentBits, EmbedBuilder, ActivityType, AttachmentBuilder } = require("discord.js");
 
 const client = new Client({
   intents: [
@@ -8,44 +8,12 @@ const client = new Client({
   ],
 });
 
-const PREFIX = "!roblox"; // Change this to whatever prefix you prefer
+const PREFIX = "!roblox";
 
-// Fetch asset details from Roblox API
-async function fetchAssetDetails(assetId) {
-  const res = await fetch(`https://economy.roblox.com/v2/assets/${assetId}/details`);
-  if (!res.ok) throw new Error(`Asset not found (HTTP ${res.status})`);
-  return res.json();
-}
+// Asset types that are visual (can show an image)
+const VISUAL_ASSET_TYPES = new Set([1, 2, 8, 11, 12, 13, 17, 18, 19, 21, 32, 38,
+  40, 41, 42, 43, 44, 45, 46, 61, 62, 64, 65, 66, 67, 68, 69, 70, 71, 72, 76, 77, 80]);
 
-// Fetch thumbnail/image URL for an asset
-async function fetchAssetThumbnail(assetId) {
-  const res = await fetch(
-    `https://thumbnails.roblox.com/v1/assets?assetIds=${assetId}&size=420x420&format=Png&isCircular=false`
-  );
-  if (!res.ok) throw new Error(`Thumbnail fetch failed (HTTP ${res.status})`);
-  const data = await res.json();
-  const item = data?.data?.[0];
-  if (!item || item.state !== "Completed") return null;
-  return item.imageUrl;
-}
-
-// Fetch creator info (user or group)
-async function fetchCreatorInfo(creatorType, creatorId) {
-  if (creatorType === "User") {
-    const res = await fetch(`https://users.roblox.com/v1/users/${creatorId}`);
-    if (!res.ok) return null;
-    const data = await res.json();
-    return { name: data.displayName || data.name, url: `https://www.roblox.com/users/${creatorId}/profile` };
-  } else if (creatorType === "Group") {
-    const res = await fetch(`https://groups.roblox.com/v1/groups/${creatorId}`);
-    if (!res.ok) return null;
-    const data = await res.json();
-    return { name: data.name, url: `https://www.roblox.com/groups/${creatorId}` };
-  }
-  return null;
-}
-
-// Map asset type IDs to readable names
 const ASSET_TYPE_NAMES = {
   1: "Image", 2: "T-Shirt", 3: "Audio", 4: "Mesh", 5: "Lua",
   6: "HTML", 7: "Text", 8: "Hat", 9: "Place", 10: "Model",
@@ -67,11 +35,125 @@ const ASSET_TYPE_NAMES = {
   79: "MoodAnimation", 80: "DynamicHead",
 };
 
+async function fetchAssetDetails(assetId) {
+  const res = await fetch(`https://economy.roblox.com/v2/assets/${assetId}/details`);
+  if (!res.ok) throw new Error(`Asset not found (HTTP ${res.status})`);
+  return res.json();
+}
+
+// Strategy 1: thumbnails API (works for catalog items, accessories, etc.)
+async function fetchThumbnailAPI(assetId) {
+  const res = await fetch(
+    `https://thumbnails.roblox.com/v1/assets?assetIds=${assetId}&size=420x420&format=Png&isCircular=false`
+  );
+  if (!res.ok) return null;
+  const data = await res.json();
+  const item = data?.data?.[0];
+  if (!item || item.state !== "Completed" || !item.imageUrl) return null;
+  return item.imageUrl;
+}
+
+// Strategy 2: asset delivery API — works for raw images/decals uploaded to Roblox
+async function fetchAssetDeliveryURL(assetId) {
+  // This redirects to the actual CDN file URL
+  const res = await fetch(`https://assetdelivery.roblox.com/v1/asset/?id=${assetId}`, {
+    redirect: "follow",
+    headers: { "User-Agent": "Roblox/WinInet" }
+  });
+  if (!res.ok) return null;
+
+  // The final URL after redirect is the CDN image URL
+  const finalUrl = res.url;
+  const contentType = res.headers.get("content-type") || "";
+
+  // Only return if it's actually an image
+  if (contentType.startsWith("image/")) {
+    return { url: finalUrl, buffer: Buffer.from(await res.arrayBuffer()), contentType };
+  }
+
+  // For XML/RBXM assets (models, decals wrapping an image), try to extract image ID
+  if (contentType.includes("xml") || contentType.includes("text")) {
+    const text = await res.text().catch(() => null);
+    if (text) {
+      // Decals contain a reference to an image asset ID inside XML
+      const match = text.match(/http[s]?:\/\/www\.roblox\.com\/asset\/\?id=(\d+)/i)
+                 || text.match(/<url>.*?\/asset\/\?id=(\d+)<\/url>/i)
+                 || text.match(/rbxassetid:\/\/(\d+)/i);
+      if (match) {
+        return { redirectId: match[1] };
+      }
+    }
+  }
+
+  return null;
+}
+
+// Strategy 3: game thumbnails endpoint (works for some assets)
+async function fetchGameThumbnail(assetId) {
+  const res = await fetch(
+    `https://thumbnails.roblox.com/v1/assets?assetIds=${assetId}&size=768x432&format=Png`
+  );
+  if (!res.ok) return null;
+  const data = await res.json();
+  const item = data?.data?.[0];
+  if (!item || item.state !== "Completed" || !item.imageUrl) return null;
+  return item.imageUrl;
+}
+
+async function fetchCreatorInfo(creatorType, creatorId) {
+  try {
+    if (creatorType === "User") {
+      const res = await fetch(`https://users.roblox.com/v1/users/${creatorId}`);
+      if (!res.ok) return null;
+      const data = await res.json();
+      return { name: data.displayName || data.name, url: `https://www.roblox.com/users/${creatorId}/profile` };
+    } else if (creatorType === "Group") {
+      const res = await fetch(`https://groups.roblox.com/v1/groups/${creatorId}`);
+      if (!res.ok) return null;
+      const data = await res.json();
+      return { name: data.name, url: `https://www.roblox.com/groups/${creatorId}` };
+    }
+  } catch { return null; }
+  return null;
+}
+
 function formatDate(dateStr) {
   if (!dateStr) return "Unknown";
   return new Date(dateStr).toLocaleDateString("en-US", {
     year: "numeric", month: "short", day: "numeric"
   });
+}
+
+async function resolveImage(assetId, assetTypeId) {
+  // Try thumbnail API first (fastest)
+  const thumb = await fetchThumbnailAPI(assetId);
+  if (thumb) return { type: "url", value: thumb };
+
+  // Try asset delivery (for raw images, decals)
+  try {
+    const delivery = await fetchAssetDeliveryURL(assetId);
+    if (delivery) {
+      // If it redirected to another asset ID (e.g. decal → image)
+      if (delivery.redirectId) {
+        const innerThumb = await fetchThumbnailAPI(delivery.redirectId);
+        if (innerThumb) return { type: "url", value: innerThumb };
+
+        // Try delivery on the inner ID too
+        const innerDelivery = await fetchAssetDeliveryURL(delivery.redirectId);
+        if (innerDelivery?.buffer) {
+          return { type: "buffer", value: innerDelivery.buffer, contentType: innerDelivery.contentType };
+        }
+      }
+      // Direct image buffer
+      if (delivery.buffer) {
+        return { type: "buffer", value: delivery.buffer, contentType: delivery.contentType };
+      }
+    }
+  } catch (e) {
+    console.error("Asset delivery error:", e.message);
+  }
+
+  return null;
 }
 
 client.once("ready", () => {
@@ -83,19 +165,12 @@ client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
 
   const content = message.content.trim();
-
-  // Check for prefix command or just a bare Roblox asset ID
   let assetId = null;
 
   if (content.startsWith(PREFIX)) {
     const args = content.slice(PREFIX.length).trim().split(/\s+/);
     assetId = args[0];
   } else {
-    // Also respond to just a number if it looks like a Roblox ID (optional - remove if too aggressive)
-    // Uncomment the lines below if you want the bot to respond to bare IDs too
-    // if (/^\d{6,}$/.test(content)) {
-    //   assetId = content;
-    // }
     return;
   }
 
@@ -111,23 +186,19 @@ client.on("messageCreate", async (message) => {
     });
   }
 
-  // Show typing indicator while fetching
   await message.channel.sendTyping();
 
   try {
-    const [details, thumbnailUrl] = await Promise.all([
-      fetchAssetDetails(assetId),
-      fetchAssetThumbnail(assetId),
-    ]);
-
+    const details = await fetchAssetDetails(assetId);
     const assetTypeName = ASSET_TYPE_NAMES[details.AssetTypeId] || `Type ${details.AssetTypeId}`;
     const assetPageUrl = `https://www.roblox.com/catalog/${assetId}`;
 
-    // Fetch creator info
-    let creatorInfo = null;
-    if (details.Creator) {
-      creatorInfo = await fetchCreatorInfo(details.Creator.CreatorType, details.Creator.CreatorTargetId);
-    }
+    const creatorInfo = details.Creator
+      ? await fetchCreatorInfo(details.Creator.CreatorType, details.Creator.CreatorTargetId)
+      : null;
+
+    // Try to resolve an image through all strategies
+    const imageResult = await resolveImage(assetId, details.AssetTypeId);
 
     const embed = new EmbedBuilder()
       .setColor(0x00b2ff)
@@ -147,21 +218,33 @@ client.on("messageCreate", async (message) => {
       .setFooter({ text: `Roblox Asset Fetcher • Requested by ${message.author.tag}`, iconURL: message.author.displayAvatarURL() })
       .setTimestamp();
 
-    if (thumbnailUrl) {
-      embed.setImage(thumbnailUrl);
-      embed.setThumbnail("https://images.rbxcdn.com/b18b35d5898b1891b0ba4a84d36c9e57-roblox-logo.png");
+    let files = [];
+
+    if (imageResult) {
+      if (imageResult.type === "url") {
+        embed.setImage(imageResult.value);
+      } else if (imageResult.type === "buffer") {
+        // Determine extension from content type
+        const ext = imageResult.contentType?.includes("png") ? "png"
+                  : imageResult.contentType?.includes("jpeg") ? "jpg"
+                  : imageResult.contentType?.includes("webp") ? "webp"
+                  : "png";
+        const attachment = new AttachmentBuilder(imageResult.value, { name: `asset_${assetId}.${ext}` });
+        embed.setImage(`attachment://asset_${assetId}.${ext}`);
+        files.push(attachment);
+      }
     } else {
-      embed.addFields({ name: "🖼️ Preview", value: "No preview available for this asset type.", inline: false });
+      embed.addFields({ name: "🖼️ Preview", value: "No preview available for this asset.", inline: false });
     }
 
-    await message.reply({ embeds: [embed] });
+    await message.reply({ embeds: [embed], files });
 
   } catch (err) {
     console.error(`Error fetching asset ${assetId}:`, err);
 
     let errorMsg = "An unexpected error occurred.";
     if (err.message.includes("404") || err.message.includes("not found")) {
-      errorMsg = `Asset ID \`${assetId}\` was not found. Make sure the ID is correct and the asset is publicly visible.`;
+      errorMsg = `Asset ID \`${assetId}\` was not found. Make sure the ID is correct and the asset is public.`;
     } else if (err.message.includes("403")) {
       errorMsg = `Access denied for asset \`${assetId}\`. It may be private or restricted.`;
     }
@@ -180,7 +263,6 @@ client.on("messageCreate", async (message) => {
   }
 });
 
-// Login — token is read from environment variable BOT_TOKEN
 const token = process.env.BOT_TOKEN;
 if (!token) {
   console.error("❌ BOT_TOKEN environment variable is not set. Please set it before running the bot.");
