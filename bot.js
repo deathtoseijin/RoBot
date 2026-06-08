@@ -31,11 +31,8 @@ const ASSET_TYPE_NAMES = {
   79: "MoodAnimation", 80: "DynamicHead",
 };
 
-// Clothing types that wrap a texture image inside XML
 const CLOTHING_TYPES = new Set([2, 11, 12]); // T-Shirt, Shirt, Pants
-// Decal type also wraps an image
 const DECAL_TYPE = 13;
-// Raw image type
 const IMAGE_TYPE = 1;
 
 async function fetchAssetDetails(assetId) {
@@ -44,50 +41,52 @@ async function fetchAssetDetails(assetId) {
   return res.json();
 }
 
-// Fetch the mannequin/preview thumbnail (for accessories, hats, gear etc.)
 async function fetchThumbnailAPI(assetId, size = "420x420") {
-  const res = await fetch(
-    `https://thumbnails.roblox.com/v1/assets?assetIds=${assetId}&size=${size}&format=Png&isCircular=false`
-  );
-  if (!res.ok) return null;
-  const data = await res.json();
-  const item = data?.data?.[0];
-  if (!item || item.state !== "Completed" || !item.imageUrl) return null;
-  return item.imageUrl;
+  try {
+    const res = await fetch(
+      `https://thumbnails.roblox.com/v1/assets?assetIds=${assetId}&size=${size}&format=Png&isCircular=false`
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const item = data?.data?.[0];
+    if (!item || item.state !== "Completed" || !item.imageUrl) return null;
+    return item.imageUrl;
+  } catch { return null; }
 }
 
-// Fetch the raw asset file and parse the inner image ID from XML (for shirts, pants, decals)
-async function fetchInnerImageIdFromAsset(assetId) {
+// Extract the inner image ID from a Roblox clothing/decal XML file
+// Uses www.roblox.com/asset/ which returns the actual XML
+async function extractInnerImageId(assetId) {
   try {
-    const res = await fetch(`https://assetdelivery.roblox.com/v1/asset/?id=${assetId}`, {
+    const res = await fetch(`https://www.roblox.com/asset/?id=${assetId}`, {
       headers: {
-        "User-Agent": "RobloxStudio/WinInet",
-        "Accept": "*/*",
-      }
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "text/xml, application/xml, */*",
+      },
+      redirect: "follow",
     });
     if (!res.ok) return null;
 
     const contentType = res.headers.get("content-type") || "";
 
-    // If it's a direct image, return the URL
+    // If it came back as a direct image
     if (contentType.startsWith("image/")) {
       const buffer = Buffer.from(await res.arrayBuffer());
       return { type: "buffer", buffer, contentType };
     }
 
-    // If it's XML (clothing/decal asset file), parse the inner image ID
     const text = await res.text();
 
-    // Patterns found in Roblox XML asset files
+    // Match the <url> tag containing the inner image asset ID
+    // Example: <url>http://www.roblox.com/asset/?id=1110654897</url>
+    const urlTagMatch = text.match(/<url[^>]*>https?:\/\/[^<]*\/asset\/\?id=(\d+)[^<]*<\/url>/i);
+    if (urlTagMatch) return { type: "id", id: urlTagMatch[1] };
+
+    // Fallback patterns
     const patterns = [
       /https?:\/\/(?:www\.)?roblox\.com\/asset\/\?id=(\d+)/i,
-      /<url>.*?\/asset\/\?id=(\d+).*?<\/url>/i,
       /rbxassetid:\/\/(\d+)/i,
-      /ShirtTemplate.*?\/asset\/\?id=(\d+)/i,
-      /PantsTemplate.*?\/asset\/\?id=(\d+)/i,
-      /Texture.*?\/asset\/\?id=(\d+)/i,
     ];
-
     for (const pattern of patterns) {
       const match = text.match(pattern);
       if (match) return { type: "id", id: match[1] };
@@ -95,25 +94,24 @@ async function fetchInnerImageIdFromAsset(assetId) {
 
     return null;
   } catch (e) {
-    console.error("fetchInnerImageIdFromAsset error:", e.message);
+    console.error("extractInnerImageId error:", e.message);
     return null;
   }
 }
 
-// Fetch an image buffer from a Roblox asset ID (must be a raw image type)
+// Fetch a raw image as a buffer from Roblox CDN
 async function fetchImageBuffer(assetId) {
   try {
-    const res = await fetch(`https://assetdelivery.roblox.com/v1/asset/?id=${assetId}`, {
-      headers: { "User-Agent": "RobloxStudio/WinInet" }
+    const res = await fetch(`https://www.roblox.com/asset/?id=${assetId}`, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+      redirect: "follow",
     });
     if (!res.ok) return null;
     const contentType = res.headers.get("content-type") || "";
     if (!contentType.startsWith("image/")) return null;
     const buffer = Buffer.from(await res.arrayBuffer());
     return { buffer, contentType };
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 async function fetchCreatorInfo(creatorType, creatorId) {
@@ -147,57 +145,52 @@ function getExtension(contentType) {
   return "png";
 }
 
-// Main image resolution — tries different strategies based on asset type
 async function resolveImage(assetId, assetTypeId) {
-
-  // CLOTHING (Shirt, Pants, T-Shirt) — fetch the XML file and get the inner texture image
+  // CLOTHING (Shirt, Pants, T-Shirt) — XML file with inner texture image ID
   if (CLOTHING_TYPES.has(assetTypeId)) {
-    const inner = await fetchInnerImageIdFromAsset(assetId);
-    if (inner) {
-      if (inner.type === "id") {
-        // Try to get the actual texture image
-        const imgBuffer = await fetchImageBuffer(inner.id);
-        if (imgBuffer) return { type: "buffer", ...imgBuffer, label: "texture" };
-        // Fallback: thumbnail of inner image
-        const thumb = await fetchThumbnailAPI(inner.id);
-        if (thumb) return { type: "url", value: thumb, label: "texture" };
-      }
-      if (inner.type === "buffer") return { type: "buffer", ...inner, label: "texture" };
-    }
-    // Last resort: mannequin thumbnail
-    const thumb = await fetchThumbnailAPI(assetId);
-    if (thumb) return { type: "url", value: thumb, label: "preview" };
-    return null;
-  }
-
-  // DECAL — wraps an image in XML, extract inner image
-  if (assetTypeId === DECAL_TYPE) {
-    const inner = await fetchInnerImageIdFromAsset(assetId);
+    const inner = await extractInnerImageId(assetId);
     if (inner?.type === "id") {
-      const imgBuffer = await fetchImageBuffer(inner.id);
-      if (imgBuffer) return { type: "buffer", ...imgBuffer, label: "decal" };
+      // Fetch the actual texture PNG
+      const imgBuf = await fetchImageBuffer(inner.id);
+      if (imgBuf) return { type: "buffer", ...imgBuf };
+      // Fallback: thumbnail of the texture image
       const thumb = await fetchThumbnailAPI(inner.id);
-      if (thumb) return { type: "url", value: thumb, label: "decal" };
+      if (thumb) return { type: "url", value: thumb };
     }
+    if (inner?.type === "buffer") return { type: "buffer", ...inner };
+    // Last resort: mannequin preview
     const thumb = await fetchThumbnailAPI(assetId);
-    if (thumb) return { type: "url", value: thumb, label: "preview" };
+    if (thumb) return { type: "url", value: thumb };
     return null;
   }
 
-  // RAW IMAGE — try direct delivery first
+  // DECAL — XML file wrapping an image
+  if (assetTypeId === DECAL_TYPE) {
+    const inner = await extractInnerImageId(assetId);
+    if (inner?.type === "id") {
+      const imgBuf = await fetchImageBuffer(inner.id);
+      if (imgBuf) return { type: "buffer", ...imgBuf };
+      const thumb = await fetchThumbnailAPI(inner.id);
+      if (thumb) return { type: "url", value: thumb };
+    }
+    if (inner?.type === "buffer") return { type: "buffer", ...inner };
+    const thumb = await fetchThumbnailAPI(assetId);
+    if (thumb) return { type: "url", value: thumb };
+    return null;
+  }
+
+  // RAW IMAGE
   if (assetTypeId === IMAGE_TYPE) {
-    const imgBuffer = await fetchImageBuffer(assetId);
-    if (imgBuffer) return { type: "buffer", ...imgBuffer, label: "image" };
-    // Some images are accessible via thumbnail API
+    const imgBuf = await fetchImageBuffer(assetId);
+    if (imgBuf) return { type: "buffer", ...imgBuf };
     const thumb = await fetchThumbnailAPI(assetId);
-    if (thumb) return { type: "url", value: thumb, label: "image" };
+    if (thumb) return { type: "url", value: thumb };
     return null;
   }
 
-  // EVERYTHING ELSE (accessories, badges, gamepasses, hats, etc.) — use thumbnail API
+  // EVERYTHING ELSE — thumbnail preview
   const thumb = await fetchThumbnailAPI(assetId);
-  if (thumb) return { type: "url", value: thumb, label: "preview" };
-
+  if (thumb) return { type: "url", value: thumb };
   return null;
 }
 
@@ -277,7 +270,7 @@ client.on("messageCreate", async (message) => {
     } else {
       embed.addFields({
         name: "🖼️ Preview",
-        value: "No preview available. This asset may be private or not publicly accessible.",
+        value: "No preview available. This asset may be private or restricted.",
         inline: false
       });
     }
@@ -314,4 +307,3 @@ if (!token) {
   process.exit(1);
 }
 client.login(token);
- 
