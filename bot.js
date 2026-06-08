@@ -35,6 +35,20 @@ const CLOTHING_TYPES = new Set([2, 11, 12]); // T-Shirt, Shirt, Pants
 const DECAL_TYPE = 13;
 const IMAGE_TYPE = 1;
 
+// Roblox cookie for authenticated asset delivery
+const ROBLOX_COOKIE = process.env.ROBLOX_COOKIE || null;
+
+function getRobloxHeaders(wantImage = false) {
+  const headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": wantImage ? "image/*, */*" : "*/*",
+  };
+  if (ROBLOX_COOKIE) {
+    headers["Cookie"] = `.ROBLOSECURITY=${ROBLOX_COOKIE}`;
+  }
+  return headers;
+}
+
 async function fetchAssetDetails(assetId) {
   const res = await fetch(`https://economy.roblox.com/v2/assets/${assetId}/details`);
   if (!res.ok) throw new Error(`Asset not found (HTTP ${res.status})`);
@@ -59,10 +73,7 @@ async function fetchThumbnailAPI(assetId, size = "420x420") {
 async function extractInnerImageId(assetId) {
   try {
     const res = await fetch(`https://www.roblox.com/asset/?id=${assetId}`, {
-      headers: {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "text/xml, application/xml, */*",
-      },
+      headers: getRobloxHeaders(),
       redirect: "follow",
     });
     if (!res.ok) return null;
@@ -103,7 +114,7 @@ async function extractInnerImageId(assetId) {
 async function fetchImageBuffer(assetId) {
   try {
     const res = await fetch(`https://www.roblox.com/asset/?id=${assetId}`, {
-      headers: { "User-Agent": "Mozilla/5.0" },
+      headers: getRobloxHeaders(true),
       redirect: "follow",
     });
     if (!res.ok) return null;
